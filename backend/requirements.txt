@@ -1,6 +1,7 @@
 fastapi
-uvicorn
+uvicorn[standard]
 azure-cognitiveservices-speech
+websockets
 aiohttp
 python-dotenv
 requests
