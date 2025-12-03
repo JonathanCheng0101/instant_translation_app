@@ -77,16 +77,16 @@ const [fixedLang, setFixedLang] = useState<string>("zh-TW"); // default Chinese
   const start = async () => {
     if (running) return;
 
-    let wsUrl ="wss://instant-translation-backend-c4fpb7arc0f8d5cv.eastus.azurewebsites.net/ws";
+    let wsUrl ="wss://instant-translation-backend-c4fpb7arc0f8d5cv.eastus-1.azurewebsites.net/ws";
    
    if (mode === "auto") {
      wsUrl =
-       "wss://instant-translation-backend-c4fpb7arc0f8d5cv.eastus.azurewebsites.net/ws";
+       "wss://instant-translation-backend-c4fpb7arc0f8d5cv.eastus-1.azurewebsites.net/ws";
    } else if (mode === "fixed") {
-     wsUrl = `wss://instant-translation-backend-c4fpb7arc0f8d5cv.eastus.azurewebsites.net/ws/fixed?lang=${fixedLang}`;
+     wsUrl = `wss://instant-translation-backend-c4fpb7arc0f8d5cv.eastus-1.azurewebsites.net/ws/fixed?lang=${fixedLang}`;
    } else if (mode === "multilang") {
      wsUrl =
-       "wss://instant-translation-backend-c4fpb7arc0f8d5cv.eastus.azurewebsites.net/ws/multilang";
+       "wss://instant-translation-backend-c4fpb7arc0f8d5cv.eastus-1.azurewebsites.net/ws/multilang";
    }
 
     ws = new WebSocket(wsUrl);
