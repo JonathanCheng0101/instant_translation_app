@@ -1,189 +1,525 @@
 import React, { useRef, useState } from "react";
 
-const WS_URL = "ws://localhost:8000/ws_stream";
+/* =============================
+   Audio / WS singletons
+============================= */
+let audioContext: AudioContext | null = null;
+let processor: ScriptProcessorNode | null = null;
+let source: MediaStreamAudioSourceNode | null = null;
+let ws: WebSocket | null = null;
 
-export default function InstantTranslation() {
-  const [log, setLog] = useState<string>("(Transcriptions will appear here)");
-  const [isRecording, setIsRecording] = useState(false);
+/* Float32 → PCM16 */
+function floatToPCM16(input: Float32Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(input.length * 2);
+  const view = new DataView(buffer);
+  let offset = 0;
+  for (let i = 0; i < input.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, input[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return buffer;
+}
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const ctxRef = useRef<AudioContext | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+/* =============================
+   Types
+============================= */
+type TranslationItem = {
+  text: string;
+  provisional: boolean;
+  striked: boolean;
+};
 
+type AsrItem = {
+  text: string;
+  striked: boolean;
+};
+
+export default function App() {
+  type Mode = "auto" | "fixed" | "multilang";
+const [mode, setMode] = useState<Mode>("auto");
+const [fixedLang, setFixedLang] = useState<string>("zh-TW"); // default Chinese
+
+  const [running, setRunning] = useState(false);
+
+  // ASR
+  const [finalLines, setFinalLines] = useState<AsrItem[]>([]);
+  const [partial, setPartial] = useState("");
+
+  // Translation
+  const [translations, setTranslations] = useState<TranslationItem[]>([]);
+  const [partialTranslation, setPartialTranslation] = useState("");
+
+  // Language UI
+  const [langText, setLangText] = useState<string | null>(null);
+  const [langState, setLangState] =
+    useState<"detecting" | "mismatch" | "final">("detecting");
+  const [langFlash, setLangFlash] = useState(false);
+
+  const provisionalLangRef = useRef<string | null>(null);
+
+  // mic
+  const [micLevel, setMicLevel] = useState(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  const scrollToBottom = () =>
+    setTimeout(
+      () =>
+        scrollRef.current?.scrollTo({
+          top: scrollRef.current.scrollHeight,
+          behavior: "smooth",
+        }),
+      0
+    );
+
+  /* =============================
+     ▶ Start
+  ============================= */
   const start = async () => {
-    if (isRecording) return;
-    setIsRecording(true);
+    if (running) return;
 
-    setLog((prev) => (prev === "(Transcriptions will appear here)" ? "" : prev));
+    let wsUrl = "ws://localhost:8000/ws";
 
-    const ws = new WebSocket(WS_URL);
+    if (mode === "auto") {
+      wsUrl = "ws://localhost:8000/ws";
+    } else if (mode === "fixed") {
+      wsUrl = `ws://localhost:8000/ws/fixed?lang=${fixedLang}`;
+    } else if (mode === "multilang") {
+      wsUrl = "ws://localhost:8000/ws/multilang";
+    }
+
+    ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
-    wsRef.current = ws;
 
-    ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
 
-        if (msg.type === "partial") {
-          setLog((prev) => {
-            const lines = prev ? prev.split("\n") : [];
-            if (lines.length === 0) {
-              return `🟡 [${msg.lang}] ${msg.text}`;
-            }
+      // Language: provisional
+      if (msg.type === "lang") {
+        provisionalLangRef.current = msg.lang;
+        setLangText("Detecting language…");
+        setLangState("detecting");
+        return;
+      }
 
-            const last = lines[lines.length - 1];
-            if (last.startsWith("🟡") || last.startsWith("🟢")) {
-              lines[lines.length - 1] = `🟡 [${msg.lang}] ${msg.text}`;
-            } else {
-              lines.push(`🟡 [${msg.lang}] ${msg.text}`);
-            }
-            return lines.join("\n");
-          });
-        } else if (msg.type === "final") {
-          setLog((prev) => {
-            const lines = prev ? prev.split("\n") : [];
-            const last = lines[lines.length - 1];
+      // Language: lock
+      if (msg.type === "lang_locked") {
+        const finalLang = msg.lang;
+        const provisional = provisionalLangRef.current;
 
-            if (last && (last.startsWith("🟡") || last.startsWith("🟢"))) {
-              lines[lines.length - 1] = `🟢 [${msg.lang}] ${msg.text}`;
-            } else {
-              lines.push(`🟢 [${msg.lang}] ${msg.text}`);
-            }
+        // mismatch
+        if (provisional && provisional !== finalLang) {
+          setLangText(`Language corrected → ${finalLang}`);
+          setLangState("mismatch");
+          setLangFlash(true);
 
-            if (msg.translation) {
-              lines.push(`🌍 ${msg.translation}`);
-            }
-
-            return lines.join("\n");
-          });
+          setTimeout(() => {
+            setLangFlash(false);
+            setLangText(`Final: ${finalLang}`);
+            setLangState("final");
+          }, 1200);
+        } else {
+          setLangText(`Final: ${finalLang}`);
+          setLangState("final");
         }
-      } catch {}
+
+        provisionalLangRef.current = finalLang;
+        return;
+      }
+
+      /* ----- 全部 invalidate（回溯重翻時用） ----- */
+      if (msg.type === "invalidate_all_asr") {
+        setFinalLines((p) => p.map((l) => ({ ...l, striked: true })));
+        return;
+      }
+
+      if (msg.type === "invalidate_all_translation") {
+        setTranslations((p) => p.map((t) => ({ ...t, striked: true })));
+        return;
+      }
+
+      /* ----- ASR ----- */
+      if (msg.type === "partial") {
+        setPartial(msg.text);
+        scrollToBottom();
+        return;
+      }
+
+      if (msg.type === "final") {
+        setFinalLines((p) => [...p, { text: msg.text, striked: false }]);
+        setPartial("");
+        scrollToBottom();
+        return;
+      }
+
+      if (msg.type === "invalidate_asr") {
+        setFinalLines((p) =>
+          p.map((l, i) =>
+            i === p.length - 1 ? { ...l, striked: true } : l
+          )
+        );
+        return;
+      }
+
+      /* ----- Translation ----- */
+      if (msg.type === "mid_translate") {
+        setPartialTranslation(msg.translated);
+        return;
+      }
+
+      if (msg.type === "final_translate") {
+        setTranslations((prev) => {
+          // replace_last: true → 把最後一條翻譯替換掉
+          if (msg.replace_last && prev.length > 0) {
+            const p = [...prev];
+            p[p.length - 1] = {
+              text: msg.translated,
+              provisional: false,
+              striked: false,
+            };
+            return p;
+          }
+
+          // 一般 append
+          return [
+            ...prev,
+            {
+              text: msg.translated,
+              provisional: msg.provisional ?? false,
+              striked: false,
+            },
+          ];
+        });
+
+        setPartialTranslation("");
+        scrollToBottom();
+        return;
+      }
+
+      if (msg.type === "invalidate_translation") {
+        setTranslations((p) =>
+          p.map((t, i) =>
+            i === p.length - 1 ? { ...t, striked: true } : t
+          )
+        );
+        return;
+      }
     };
 
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const ctx = new AudioContext({ sampleRate: 16000 });
-    ctxRef.current = ctx;
+    ws.onopen = async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-    const source = ctx.createMediaStreamSource(stream);
-    sourceRef.current = source;
+      audioContext = new AudioContext({ sampleRate: 16000 });
+      await audioContext.resume();
 
-    const processor = ctx.createScriptProcessor(4096, 1, 1);
-    processorRef.current = processor;
+      source = audioContext.createMediaStreamSource(stream);
+      processor = audioContext.createScriptProcessor(4096, 1, 1);
 
-    processor.onaudioprocess = (e) => {
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-      const input = e.inputBuffer.getChannelData(0);
-      wsRef.current.send(floatTo16BitPCM(input));
+      processor.onaudioprocess = (e) => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        const ch = e.inputBuffer.getChannelData(0);
+        let sum = 0;
+        for (let i = 0; i < ch.length; i++) sum += ch[i] * ch[i];
+        setMicLevel(Math.min(1, Math.sqrt(sum / ch.length) * 5));
+
+        ws!.send(floatToPCM16(ch));
+      };
+
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+
+      // reset
+      setFinalLines([]);
+      setTranslations([]);
+      setPartial("");
+      setPartialTranslation("");
+      setLangText(null);
+      setLangState("detecting");
+      setRunning(true);
     };
-
-    source.connect(processor);
-    processor.connect(ctx.destination);
   };
 
   const stop = () => {
-    setIsRecording(false);
-
-    setLog((prev) => (prev ? prev + "\n⏹ Recording stopped" : "⏹ Recording stopped"));
-
-    try {
-      processorRef.current?.disconnect();
-      sourceRef.current?.disconnect();
-      ctxRef.current?.close();
-    } catch {}
-
-    try {
-      wsRef.current?.send("END");
-      wsRef.current?.close();
-    } catch {}
+    processor?.disconnect();
+    source?.disconnect();
+    audioContext?.close();
+    ws?.close();
+    setRunning(false);
   };
 
-  const floatTo16BitPCM = (float32: Float32Array) => {
-    const buf = new ArrayBuffer(float32.length * 2);
-    const view = new DataView(buf);
-    for (let i = 0; i < float32.length; i++) {
-      let s = Math.max(-1, Math.min(1, float32[i]));
-      view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-    }
-    return buf;
-  };
 
+  const styles: Record<string, React.CSSProperties> = {
+  page: {
+    minHeight: "100vh",
+    background: "#efece6",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+    fontFamily:
+      "-apple-system, BlinkMacSystemFont, 'Inter', Segoe UI, Arial, sans-serif",
+  },
+  card: {
+    width: 720,
+    maxWidth: "100%",
+    background: "#faf9f7",
+    borderRadius: 24,
+    padding: 32,
+    boxShadow: "0 45px 90px rgba(0,0,0,0.2)",
+  },
+  header: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 16,
+    marginBottom: 16,
+  },
+  buttonRow: {
+    display: "flex",
+    gap: 14,
+    marginBottom: 16,
+  },
+  buttonPrimary: {
+    flex: 1,
+    padding: 14,
+    borderRadius: 18,
+    background: "#8fa3a6",
+    color: "#fff",
+    border: "none",
+    fontSize: 16,
+    cursor: "pointer",
+  },
+  buttonSecondary: {
+    flex: 1,
+    padding: 14,
+    borderRadius: 18,
+    background: "#c1cbc4",
+    border: "none",
+    fontSize: 16,
+    cursor: "pointer",
+  },
+  transcript: {
+    height: 420,
+    overflowY: "auto",
+    background: "#f3f4f2",
+    borderRadius: 16,
+    padding: 16,
+    fontSize: 15,
+    lineHeight: 1.5,
+  },
+
+  /* language status */
+  langBox: {
+    padding: "8px 14px",
+    fontSize: 15,
+    fontWeight: 600,
+    borderRadius: 12,
+    transition: "all 0.35s ease",
+    borderLeft: "6px solid transparent",
+    whiteSpace: "nowrap",
+  },
+  langDetect: {
+    background: "#e6edf3",
+    color: "#4a5568",
+    borderLeftColor: "#a0aec0",
+  },
+  langMismatch: {
+    background: "#fff3e0",
+    color: "#dd6b20",
+    borderLeftColor: "#dd6b20",
+    boxShadow: "0 0 0 4px rgba(221,107,32,0.25)",
+  },
+  langFinal: {
+    background: "#e6fffa",
+    color: "#276749",
+    borderLeftColor: "#38a169",
+  },
+};
+
+
+
+  /* =============================
+     🎨 UI
+============================= */
   return (
-    <div
-      style={{
-        padding: 24,
-        fontFamily: "Inter, sans-serif",
-        background: "#EAE6DF", // Morandi beige
-        minHeight: "100vh",
-        display: "flex",
-        justifyContent: "center",
-        color: "#4A4A48",
-      }}
-    >
-      <div
-        style={{
-          width: "100%",
-          maxWidth: 700,
-          background: "#F4F1EC", // soft Morandi gray-white
-          padding: 28,
-          borderRadius: 14,
-          boxShadow: "0 4px 20px rgba(0,0,0,0.08)",
-        }}
-      >
-        <h2 style={{ marginTop: 0, fontSize: "1.6rem", color: "#5A5853" }}>
-           Instant Translation
-        </h2>
+  <div style={styles.page}>
+    <div style={styles.card}>
+      {/* title + language status */}
+      <div style={styles.header}>
+        <h1>🎙 Instant Translation</h1>
 
-        {!isRecording ? (
-          <button
-            onClick={start}
+        {langText && (
+          <div
             style={{
-              background: "#40739cff",
-              border: "none",
-              padding: "10px 18px",
-              borderRadius: 10,
-              color: "#fff",
-              fontSize: "1rem",
-              cursor: "pointer",
+              ...styles.langBox,
+              ...(langState === "final"
+                ? styles.langFinal
+                : langState === "mismatch"
+                ? styles.langMismatch
+                : styles.langDetect),
+              transform: langFlash ? "scale(1.06)" : "scale(1)",
             }}
           >
-            🎙 Start Recording
-          </button>
-        ) : (
-          <button
-            onClick={stop}
-            style={{
-              background: "#c06255ff",
-              border: "none",
-              padding: "10px 18px",
-              borderRadius: 10,
-              color: "#fff",
-              fontSize: "1rem",
-              cursor: "pointer",
-            }}
-          >
-            ⏹ Stop Recording
-          </button>
+            {langText}
+          </div>
         )}
+      </div>
 
-        <pre
+      {/* ===== Mode Selector ===== */}
+      <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+        <button
+          onClick={() => setMode("auto")}
           style={{
-            marginTop: 18,
-            whiteSpace: "pre-wrap",
-            background: "#ebe2d3ff",
-            padding: 16,
+            padding: "8px 14px",
             borderRadius: 12,
-            height: 420,
-            overflowY: "auto",
-            fontSize: "1.08rem",
-            lineHeight: "1.6em",
-            color: "#4A4A48",
-            border: "1px solid #D8D3CC",
+            border: "none",
+            cursor: "pointer",
+            background: mode === "auto" ? "#8fa3a6" : "#ddd",
+            color: mode === "auto" ? "#fff" : "#333",
           }}
         >
-          {log}
-        </pre>
+          Auto Detect
+        </button>
+
+        <button
+          onClick={() => setMode("fixed")}
+          style={{
+            padding: "8px 14px",
+            borderRadius: 12,
+            border: "none",
+            cursor: "pointer",
+            background: mode === "fixed" ? "#8fa3a6" : "#ddd",
+            color: mode === "fixed" ? "#fff" : "#333",
+          }}
+        >
+          Fixed Language
+        </button>
+
+        <button
+          onClick={() => setMode("multilang")}
+          style={{
+            padding: "8px 14px",
+            borderRadius: 12,
+            border: "none",
+            cursor: "pointer",
+            background: mode === "multilang" ? "#8fa3a6" : "#ddd",
+            color: mode === "multilang" ? "#fff" : "#333",
+          }}
+        >
+          Multi Language
+        </button>
+
+        {mode === "fixed" && (
+          <select
+            value={fixedLang}
+            onChange={(e) => setFixedLang(e.target.value)}
+            style={{
+              marginLeft: 8,
+              padding: "8px 12px",
+              borderRadius: 10,
+            }}
+          >
+            <option value="en">English</option>
+            <option value="zh">Chinese (Mandarin)</option>
+            <option value="ja">Japanese</option>
+            <option value="ko">Korean</option>
+            <option value="th">Thai</option>
+            <option value="vi">Vietnamese</option>
+            <option value="id">Indonesian</option>
+            <option value="ms">Malay</option>
+            <option value="hi">Hindi</option>
+            <option value="es">Spanish</option>
+            <option value="fr">French</option>
+            <option value="de">German</option>
+            <option value="pt">Portuguese</option>
+          </select>
+        )}
+      </div>
+
+      {/* ===== Controls ===== */}
+      <div style={styles.buttonRow}>
+        <button
+          style={styles.buttonPrimary}
+          disabled={running}
+          onClick={start}
+        >
+          {running ? "Listening…" : "Start"}
+        </button>
+        <button
+          style={styles.buttonSecondary}
+          disabled={!running}
+          onClick={stop}
+        >
+          Stop
+        </button>
+      </div>
+
+      {/* mic level */}
+      <div style={{ marginBottom: 12 }}>
+        <div
+          style={{
+            height: 6,
+            borderRadius: 999,
+            background: "#d4d7d3",
+            overflow: "hidden",
+          }}
+        >
+          <div
+            style={{
+              width: `${Math.round(micLevel * 100)}%`,
+              height: "100%",
+              background: "#8fa3a6",
+              transition: "width 0.05s linear",
+            }}
+          />
+        </div>
+      </div>
+
+      {/* ===== Transcript ===== */}
+      <div style={styles.transcript} ref={scrollRef}>
+        {/* Original */}
+        {finalLines.map((l, i) => (
+          <div key={i} style={{ display: "flex", gap: 6 }}>
+            <span>🗣</span>
+            {l.striked ? (
+              <span style={{ textDecoration: "line-through", opacity: 0.7 }}>
+                {l.text}
+              </span>
+            ) : (
+              <span>{l.text}</span>
+            )}
+          </div>
+        ))}
+
+        {/* Translation */}
+        {translations.map((t, i) => (
+          <div key={`t${i}`} style={{ display: "flex", gap: 6 }}>
+            <span>🌍</span>
+            {t.striked ? (
+              <span style={{ textDecoration: "line-through", opacity: 0.7 }}>
+                {t.text}
+              </span>
+            ) : (
+              <span>{t.text}</span>
+            )}
+          </div>
+        ))}
+
+        {/* partial */}
+        {partial && (
+          <div style={{ display: "flex", gap: 6 }}>
+            <span>🗣</span>
+            <span>{partial}</span>
+          </div>
+        )}
+
+        {partialTranslation && (
+          <div style={{ display: "flex", gap: 6 }}>
+            <span>🌍</span>
+            <span>{partialTranslation}</span>
+          </div>
+        )}
       </div>
     </div>
-  );
+  </div>
+);
 }

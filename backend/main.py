@@ -1,447 +1,555 @@
 import os
-import asyncio
-import json
-import logging
-import struct
 import io
+import time
+import asyncio
+import struct
+import logging
+from typing import List, Dict, Any, Optional
 
-import azure.cognitiveservices.speech as speechsdk
+import aiohttp
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import aiohttp
+import azure.cognitiveservices.speech as speechsdk
+from ws_fixed import ws_fixed
+from ws_multilang_adaptive import ws_multilang_adaptive
 
-# ====================================================
-# 初始化
-# ====================================================
+
+# =============================
+# Init
+# =============================
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("gateway")
+log = logging.getLogger("asr")
+
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
+AZURE_TRANSLATOR_KEY = os.getenv("AZURE_TRANSLATOR_KEY")
+AZURE_TRANSLATOR_REGION = os.getenv("AZURE_TRANSLATOR_REGION")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
+  raise RuntimeError("AZURE SPEECH ENV NOT SET")
+if not AZURE_TRANSLATOR_KEY or not AZURE_TRANSLATOR_REGION:
+  raise RuntimeError("AZURE TRANSLATOR ENV NOT SET")
+if not OPENAI_API_KEY:
+  raise RuntimeError("OPENAI_API_KEY NOT SET")
 
 app = FastAPI()
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+  CORSMiddleware,
+  allow_origins=["*"],
+  allow_methods=["*"],
+  allow_headers=["*"],
 )
 
-SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
-SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
-TRANSLATOR_KEY = os.getenv("AZURE_TRANSLATOR_KEY")
-TRANSLATOR_REGION = os.getenv("AZURE_TRANSLATOR_REGION")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# 目標翻譯語言（Azure Translator 的 to）
+TARGET_LANG = "en"
 
-# ====================================================
-# Whisper → Azure Top 40 語言 mapping
-# ====================================================
-WHISPER_TO_AZURE = {
-
-    # 英文（全球）
-    "en": "en-US",
-
-    # 中文（含廣東）
-    "zh": "zh-CN",        # 普通話
-    "zh-tw": "zh-TW",     # 台灣
-    "yue": "yue-CN",      # 粵語
-
-    # 東亞
-    "ja": "ja-JP",
-    "ko": "ko-KR",
-
-    # 東南亞
-    "vi": "vi-VN",
-    "th": "th-TH",
-    "id": "id-ID",
-    "ms": "ms-MY",
-
-    # 印度語族（最常用）
-    "hi": "hi-IN",
-    "bn": "bn-IN",
-    "ta": "ta-IN",
-
-    # 蒙古語
-    "mn": "mn-MN",
-
-    # 西歐
-    "fr": "fr-FR",
-    "de": "de-DE",
-    "es": "es-ES",
-    "pt": "pt-BR",
-    "it": "it-IT",
-    "nl": "nl-NL",
-    "sv": "sv-SE",
-    "no": "nb-NO",
-    "da": "da-DK",
-    "fi": "fi-FI",
-
-    # 東歐
-    "pl": "pl-PL",
-    "cs": "cs-CZ",
-    "sk": "sk-SK",
-    "hu": "hu-HU",
-    "ro": "ro-RO",
-    "bg": "bg-BG",
-
-    # 俄羅斯系
-    "ru": "ru-RU",
-    "uk": "uk-UA",
-    "kk": "kk-KZ",
-
-    # 中東
-    "ar": "ar-EG",
-    "he": "he-IL",
-    "tr": "tr-TR",
-    "fa": "fa-IR",
-
-    # 非洲（Azure 支援度最高）
-    "sw": "sw-KE",
+# =============================
+# Language map (Whisper -> Azure)
+# =============================
+LANG_MAP = {
+  "english": "en-US", "en": "en-US",
+  "chinese": "zh-TW", "mandarin": "zh-CN", "zh": "zh-CN",
+  "japanese": "ja-JP", "ja": "ja-JP",
+  "korean": "ko-KR", "ko": "ko-KR",
+  "thai": "th-TH", "th": "th-TH",
+  "vietnamese": "vi-VN", "vi": "vi-VN",
+  "indonesian": "id-ID", "id": "id-ID",
+  "malay": "ms-MY", "ms": "ms-MY",
+  "hindi": "hi-IN", "hi": "hi-IN",
+  "french": "fr-FR", "fr": "fr-FR",
+  "german": "de-DE", "de": "de-DE",
+  "spanish": "es-ES", "es": "es-ES",
+  "portuguese": "pt-PT", "pt": "pt-PT",
 }
 
-# ====================================================
-# PCM → WAV（給 Whisper）
-# ====================================================
-def pcm_to_wav(pcm_bytes: bytes, sample_rate=16000, bits_per_sample=16, channels=1) -> bytes:
-    byte_rate = sample_rate * channels * bits_per_sample // 8
-    block_align = channels * bits_per_sample // 8
-    data_size = len(pcm_bytes)
-    riff_size = 36 + data_size
+# =============================
+# Detection timing
+# =============================
+SILENCE_RMS_THRESHOLD = 300
+MIN_DETECT_SEC = 0.8   # 等 0.8 秒就先用 Whisper 判語言
+MAX_DETECT_SEC = 8.0
 
-    wav = io.BytesIO()
-    wav.write(b'RIFF')
-    wav.write(struct.pack('<I', riff_size))
-    wav.write(b'WAVE')
-    wav.write(b'fmt ')
-    wav.write(struct.pack('<I', 16))
-    wav.write(struct.pack('<H', 1))
-    wav.write(struct.pack('<H', channels))
-    wav.write(struct.pack('<I', sample_rate))
-    wav.write(struct.pack('<I', byte_rate))
-    wav.write(struct.pack('<H', block_align))
-    wav.write(struct.pack('<H', bits_per_sample))
-    wav.write(b'data')
-    wav.write(struct.pack('<I', data_size))
-    wav.write(pcm_bytes)
+# =============================
+# Utils
+# =============================
+def pcm_to_wav(pcm: bytes) -> bytes:
+  """16 kHz mono PCM16 -> WAV bytes"""
+  buf = io.BytesIO()
+  buf.write(b"RIFF")
+  buf.write(struct.pack("<I", 36 + len(pcm)))
+  buf.write(b"WAVEfmt ")
+  buf.write(struct.pack("<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16))
+  buf.write(b"data")
+  buf.write(struct.pack("<I", len(pcm)))
+  buf.write(pcm)
+  return buf.getvalue()
 
-    return wav.getvalue()
 
-# ====================================================
-# Whisper detect
-# ====================================================
-async def whisper_detect_language(wav_bytes: bytes) -> str:
-    url = "https://api.openai.com/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+def rms_energy(pcm: bytes) -> float:
+  if not pcm:
+    return 0.0
+  samples = struct.unpack("<" + "h" * (len(pcm) // 2), pcm)
+  return (sum(s * s for s in samples) / len(samples)) ** 0.5
 
-    form = aiohttp.FormData()
-    form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
-    form.add_field("model", "whisper-1")
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, data=form) as resp:
-            data = await resp.json()
-            if resp.status != 200:
-                logger.error(f"Whisper error: {data}")
-                return "unknown"
-            return data.get("language", "unknown")
+# =============================
+# Whisper detect (language only)
+# =============================
+async def whisper_detect(pcm: bytes) -> str:
+  """用 Whisper 根據音檔判斷語言（不取文字）"""
+  if not pcm:
+    return "unknown"
 
-# ====================================================
-# Azure translator detect
-# ====================================================
-async def detect_language(text: str) -> str:
-    if not text:
+  wav = pcm_to_wav(pcm)
+  url = "https://api.openai.com/v1/audio/transcriptions"
+  headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+
+  form = aiohttp.FormData()
+  form.add_field("file", wav, filename="audio.wav", content_type="audio/wav")
+  form.add_field("model", "whisper-1")
+  form.add_field("response_format", "verbose_json")
+
+  async with aiohttp.ClientSession() as session:
+    async with session.post(url, headers=headers, data=form) as resp:
+      if resp.status != 200:
+        log.error(await resp.text())
         return "unknown"
+      data = await resp.json()
+      return (data.get("language") or "unknown").lower()
 
-    endpoint = "https://api.cognitive.microsofttranslator.com/detect"
-    params = "?api-version=3.0"
-    headers = {
-        "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-        "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,
-        "Content-Type": "application/json",
-    }
-    body = [{"text": text}]
-    async with aiohttp.ClientSession() as session:
-        async with session.post(endpoint + params, headers=headers, json=body) as resp:
-            data = await resp.json()
-            try:
-                return data[0]["language"]
-            except:
-                return "unknown"
 
-# ====================================================
-# 翻譯方向
-# ====================================================
-def decide_to_lang(lang: str) -> str:
-    lang = (lang or "").lower()
-    if lang.startswith("en"):
-        return "zh-Hant"
-    elif lang.startswith("zh"):
-        return "en"
-    elif lang.startswith("ja"):
-        return "zh-Hant"
-    else:
-        return "en"
+# =============================
+# Whisper transcribe (原文)
+# =============================
+async def whisper_transcribe(pcm: bytes) -> str:
+  """用 Whisper 拿「正確原文」（不翻譯）"""
+  if not pcm:
+    return ""
+  wav = pcm_to_wav(pcm)
+  url = "https://api.openai.com/v1/audio/transcriptions"
+  headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
-# ====================================================
-# 翻譯
-# ====================================================
-async def translate_text(text, to_lang):
-    if not text:
+  form = aiohttp.FormData()
+  form.add_field("file", wav, filename="audio.wav", content_type="audio/wav")
+  form.add_field("model", "whisper-1")
+
+  async with aiohttp.ClientSession() as session:
+    async with session.post(url, headers=headers, data=form) as resp:
+      if resp.status != 200:
+        log.error(await resp.text())
         return ""
-    endpoint = "https://api.cognitive.microsofttranslator.com/translate"
-    params = f"?api-version=3.0&to={to_lang}"
+      data = await resp.json()
+      return data.get("text", "")
 
-    headers = {
-        "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-        "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,
-        "Content-Type": "application/json",
-    }
 
-    body = [{"text": text}]
-    async with aiohttp.ClientSession() as session:
-        async with session.post(endpoint + params, headers=headers, json=body) as resp:
-            data = await resp.json()
-            try:
-                return data[0]["translations"][0]["text"]
-            except:
-                return ""
+# =============================
+# Whisper translate (for correction)
+# =============================
+async def whisper_translate(pcm: bytes) -> str:
+  """
+  用 Whisper 直接把這個 utterance 翻成 TARGET_LANG
+  （專門用在「語言判錯後」的補救）
+  """
+  if not pcm:
+    return ""
+  wav = pcm_to_wav(pcm)
+  url = "https://api.openai.com/v1/audio/translations"
+  headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
-# ====================================================
-# WebSocket 主邏輯
-# ====================================================
-@app.websocket("/ws_stream")
-async def ws(websocket: WebSocket):
-    await websocket.accept()
-    logger.info("🔌 WebSocket connected")
+  form = aiohttp.FormData()
+  form.add_field("file", wav, filename="audio.wav", content_type="audio/wav")
+  form.add_field("model", "whisper-1")
 
-    loop = asyncio.get_running_loop()
+  async with aiohttp.ClientSession() as session:
+    async with session.post(url, headers=headers, data=form) as resp:
+      if resp.status != 200:
+        log.error(await resp.text())
+        return ""
+      data = await resp.json()
+      return data.get("text", "")
 
-    fmt = speechsdk.audio.AudioStreamFormat(16000, 16, 1)
-    stream = speechsdk.audio.PushAudioInputStream(stream_format=fmt)
-    audio_config = speechsdk.audio.AudioConfig(stream=stream)
 
-    speech_config = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
-    speech_config.enable_dictation()
+# =============================
+# Azure Translator
+# =============================
+async def azure_translate(text: str, target: str) -> str:
+  if not text.strip():
+    return ""
+  url = "https://api.cognitive.microsofttranslator.com/translate"
+  params = {"api-version": "3.0", "to": target}
+  headers = {
+    "Ocp-Apim-Subscription-Key": AZURE_TRANSLATOR_KEY,
+    "Ocp-Apim-Subscription-Region": AZURE_TRANSLATOR_REGION,
+    "Content-Type": "application/json",
+  }
+  async with aiohttp.ClientSession() as session:
+    async with session.post(
+      url, params=params, headers=headers, json=[{"text": text}]
+    ) as resp:
+      data = await resp.json()
+      return data[0]["translations"][0]["text"]
 
-    # 預設語言（第 4 slot 等 Whisper detect 來改）
-    default_auto = ["zh-TW", "en-US", "ja-JP", "en-US"]
 
-    auto_lang = speechsdk.languageconfig.AutoDetectSourceLanguageConfig(
-        languages=default_auto
+# =============================
+# Embedding & cosine for merge
+# =============================
+async def embed(text: str):
+  if not text:
+    return None
+  url = "https://api.openai.com/v1/embeddings"
+  headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+  async with aiohttp.ClientSession() as session:
+    async with session.post(
+      url,
+      headers=headers,
+      json={"model": "text-embedding-3-small", "input": text},
+    ) as resp:
+      if resp.status != 200:
+        log.error(await resp.text())
+        return None
+      data = await resp.json()
+      return data["data"][0]["embedding"]
+
+
+def cosine(a, b) -> float:
+  dot = sum(x * y for x, y in zip(a, b))
+  na = sum(x * x for x in a) ** 0.5
+  nb = sum(x * x for x in b) ** 0.5
+  return dot / (na * nb + 1e-8)
+
+
+# =============================
+# WebSocket ASR
+# =============================
+@app.websocket("/ws")
+async def ws_asr(ws: WebSocket):
+  await ws.accept()
+  log.info("🔌 client connected")
+
+  # --- audio buffers ---
+  detect_buffer = bytearray()         # 語言偵測用（前 0.8s）
+  current_utt_audio = bytearray()     # 當前 utterance 的 PCM（給 Whisper 保險用）
+
+  # --- language state ---
+  provisional_lang: Optional[str] = None  # Whisper 第一輪判到的語言（還沒保險）
+  lang_locked = False                     # 是否已經「第一句驗證通過」→ lock in
+
+  recognizer: Optional[speechsdk.SpeechRecognizer] = None
+  push_stream: Optional[speechsdk.audio.PushAudioInputStream] = None
+  loop = asyncio.get_running_loop()
+
+  first_speech_time: Optional[float] = None
+
+  # --- sentence merge state (for translation output) ---
+  last_translation_text: Optional[str] = None
+  last_translation_time: Optional[float] = None
+  last_translation_embedding: Any = None
+
+  # --- utterance history (for rewind when mismatch) ---
+  # 每個元素：{"pcm": bytes, "azure_text": str, "azure_translation": str}
+  utterance_history: List[Dict[str, Any]] = []
+
+  # =============================
+  # Azure ASR control
+  # =============================
+  async def start_azure(lang: str):
+    """啟動指定語言的 Azure ASR session"""
+    nonlocal recognizer, push_stream
+    nonlocal last_translation_text, last_translation_time, last_translation_embedding
+
+    azure_lang = LANG_MAP.get(lang, "en-US")
+    log.info(f"🟢 Azure ASR start: {azure_lang}")
+
+    cfg = speechsdk.SpeechConfig(
+      subscription=AZURE_SPEECH_KEY,
+      region=AZURE_SPEECH_REGION,
     )
+    cfg.speech_recognition_language = azure_lang
 
+    push_stream = speechsdk.audio.PushAudioInputStream(
+      speechsdk.audio.AudioStreamFormat(16000, 16, 1)
+    )
     recognizer = speechsdk.SpeechRecognizer(
-        speech_config=speech_config,
-        audio_config=audio_config,
-        auto_detect_source_language_config=auto_lang,
+      cfg, speechsdk.audio.AudioConfig(stream=push_stream)
     )
 
-    # 狀態
-    audio_buffer = bytearray()
-    partial_buffer = []
-    whisper_lang = None
-    first_partial_time = None
-    websocket_active = True  # ⭐ 保護 flag
+    async def send_mid_translate(text: str):
+      # partial 的即時翻譯：語言還沒 lock 的時候也可以翻，但前端可以標示「provisional」
+      trans = await azure_translate(text, TARGET_LANG)
+      await ws.send_json({"type": "mid_translate", "translated": trans})
 
-    # ====================================================
-    # 更新 Azure 語言模型（動態）
-    # ====================================================
-    async def update_azure_language(lang_code):
-        nonlocal recognizer, auto_lang, websocket_active
-
-        if not websocket_active:
-            return
-
-        azure_lang = WHISPER_TO_AZURE.get(lang_code)
-        if not azure_lang:
-            logger.warning(f"⚠️ Whisper 語言 Azure 不支援：{lang_code}")
-            return
-
-        logger.info(f"🔄 Azure 切換語言 → {azure_lang}")
-
-        auto_lang = speechsdk.languageconfig.AutoDetectSourceLanguageConfig(
-            languages=["zh-TW", "en-US", "ja-JP", azure_lang]
+    def on_partial(evt):
+      if evt.result.text:
+        # partial ASR
+        asyncio.run_coroutine_threadsafe(
+          ws.send_json({"type": "partial", "text": evt.result.text}),
+          loop,
+        )
+        # partial 翻譯
+        asyncio.run_coroutine_threadsafe(
+          send_mid_translate(evt.result.text),
+          loop,
         )
 
-        try:
-            recognizer.stop_continuous_recognition_async().get()
-        except Exception as e:
-            logger.warning(f"stop recognizer error: {e}")
+    async def on_final(text: str):
+      """
+      每個 utterance 結束時被呼叫：
+      1. 先送 Azure ASR 原文 & 翻譯（provisional / final）
+      2. 再拿這個 utterance 的 PCM 給 Whisper 重判語言做「保險」
+      3. 若發現 mismatch → 回溯「所有已經講過的 utterances」重新翻譯
+      """
+      nonlocal provisional_lang, lang_locked
+      nonlocal current_utt_audio
+      nonlocal last_translation_text, last_translation_time, last_translation_embedding
+      nonlocal utterance_history
 
-        if not websocket_active:
-            return
+      # 這個 utterance 單獨的 PCM（保險用）
+      utt_pcm = bytes(current_utt_audio)
 
-        recognizer = speechsdk.SpeechRecognizer(
-            speech_config=speech_config,
-            audio_config=audio_config,
-            auto_detect_source_language_config=auto_lang,
+      # 先把這一句記錄到 history（先記 PCM，之後補上 text / translation）
+      history_entry: Dict[str, Any] = {
+        "pcm": utt_pcm,
+        "azure_text": text,
+        "azure_translation": None,
+      }
+      utterance_history.append(history_entry)
+
+      # -----------------
+      # 1) 原文
+      # -----------------
+      await ws.send_json({"type": "final", "text": text})
+
+      # 2) 翻譯（先照目前語言翻，是否 provisional 由 lang_locked 決定）
+      trans = await azure_translate(text, TARGET_LANG)
+      history_entry["azure_translation"] = trans
+
+      now = time.perf_counter()
+      merge = False
+      emb = None
+      try:
+        emb = await embed(trans)
+      except Exception as e:
+        log.error(f"embedding error: {e}")
+
+      if (
+        emb is not None
+        and last_translation_embedding is not None
+        and last_translation_time is not None
+      ):
+        sim = cosine(emb, last_translation_embedding)
+        dt = now - last_translation_time
+        # 語境接近 / 停頓短 → 視為同一句補尾巴
+        if sim > 0.75 and dt < 1.0:
+          merge = True
+
+      if merge and last_translation_text is not None:
+        merged_text = last_translation_text + " " + trans
+        await ws.send_json(
+          {
+            "type": "final_translate",
+            "translated": merged_text,
+            "provisional": not lang_locked,
+            "replace_last": True,
+          }
+        )
+        last_translation_text = merged_text
+      else:
+        await ws.send_json(
+          {
+            "type": "final_translate",
+            "translated": trans,
+            "provisional": not lang_locked,
+            "replace_last": False,
+          }
+        )
+        last_translation_text = trans
+
+      if emb is not None:
+        last_translation_embedding = emb
+        last_translation_time = now
+
+      # -----------------
+      # 3) Whisper 保險：用「整句 utterance」重判語言
+      # -----------------
+      detected = await whisper_detect(utt_pcm)
+      log.info(f"🔍 Verification detect (this utt): {detected}")
+
+      # 第一次有 provisional 結果時，Whisper 也還沒判過 → 這裡補上
+      if provisional_lang is None and detected in LANG_MAP:
+        provisional_lang = detected
+
+      # ✅ 語言已經 lock 過就不再動了（你目前設計）
+      if lang_locked:
+        current_utt_audio.clear()
+        return
+
+      # --- Case A: mismatch → 直接改用新語言，並回溯所有 utterances ---
+      if provisional_lang is not None and detected in LANG_MAP and detected != provisional_lang:
+        log.info(
+          f"⚠️ Utterance lang mismatch: provisional={provisional_lang}, detected={detected}"
         )
 
-        recognizer.recognizing.connect(on_recognizing)
-        recognizer.recognized.connect(on_recognized)
+        # 0) reset translation merge context
+        last_translation_text = None
+        last_translation_embedding = None
+        last_translation_time = None
 
-        try:
-            recognizer.start_continuous_recognition_async().get()
-        except Exception as e:
-            logger.warning(f"restart recognizer error: {e}")
+        # 1) 通知前端：所有之前的 ASR / translation 都是錯的 → 全部畫刪除線
+        await ws.send_json({"type": "invalidate_all_asr"})
+        await ws.send_json({"type": "invalidate_all_translation"})
 
-    # ====================================================
-    # 語言確定後 → 回頭修正
-    # ====================================================
-    async def correct_previous_partials(lang_code):
-        nonlocal partial_buffer, websocket_active
+        # 2) 用新語言（實際上 Whisper auto detect）對「所有歷史 utterances」重翻
+        for idx, entry in enumerate(utterance_history):
+          pcm_bytes: bytes = entry["pcm"]
 
-        if not websocket_active:
-            return
-        if not partial_buffer:
-            return
+          correct_text = await whisper_transcribe(pcm_bytes)
+          correct_trans = await whisper_translate(pcm_bytes)
 
-        combined = " ".join(partial_buffer)
-        corrected = await translate_text(combined, decide_to_lang(lang_code))
-
-        try:
-            await websocket.send_text(json.dumps({
-                "type": "correction",
-                "text": combined,
-                "lang": lang_code,
-                "translation": corrected,
-            }))
-        except Exception as e:
-            logger.warning(f"send correction failed: {e}")
-
-        partial_buffer.clear()
-
-    # ====================================================
-    # Whisper detect trigger
-    # ====================================================
-    async def try_whisper():
-        nonlocal whisper_lang, first_partial_time, audio_buffer, websocket_active
-
-        if not websocket_active:
-            return
-        if whisper_lang is not None:
-            return
-        if first_partial_time is None:
-            return
-
-        now = loop.time()
-        if now - first_partial_time < 2.0:
-            return
-
-        wav_bytes = pcm_to_wav(bytes(audio_buffer))
-        lang = await whisper_detect_language(wav_bytes)
-        whisper_lang = lang
-        print(f"🌍 Whisper detect: {lang}")
-
-        if lang != "unknown" and websocket_active:
-            asyncio.run_coroutine_threadsafe(update_azure_language(lang), loop)
-            asyncio.run_coroutine_threadsafe(correct_previous_partials(lang), loop)
-
-    # ====================================================
-    # partial
-    # ====================================================
-    async def send_partial(text):
-        nonlocal partial_buffer, websocket_active
-
-        if not websocket_active:
-            return
-
-        lang = whisper_lang or await detect_language(text)
-        translated = await translate_text(text, decide_to_lang(lang))
-
-        try:
-            await websocket.send_text(json.dumps({
-                "type": "partial",
-                "text": text,
-                "lang": lang,
-                "translation": translated,
-            }))
-        except Exception as e:
-            logger.warning(f"send partial failed: {e}")
-            return
-
-        partial_buffer.append(text)
-
-    def on_recognizing(evt):
-        nonlocal first_partial_time, websocket_active
-
-        if not websocket_active:
-            return
-
-        if evt.result.reason == speechsdk.ResultReason.RecognizingSpeech and evt.result.text:
-            if first_partial_time is None:
-                first_partial_time = loop.time()
-
-            asyncio.run_coroutine_threadsafe(try_whisper(), loop)
-            asyncio.run_coroutine_threadsafe(send_partial(evt.result.text), loop)
-
-    # ====================================================
-    # final
-    # ====================================================
-    async def send_final(text):
-        nonlocal whisper_lang, partial_buffer, audio_buffer, first_partial_time, websocket_active
-
-        if not websocket_active:
-            return
-
-        lang = whisper_lang or await detect_language(text)
-        translated = await translate_text(text, decide_to_lang(lang))
-
-        try:
-            await websocket.send_text(json.dumps({
+          if correct_text.strip():
+            await ws.send_json(
+              {
                 "type": "final",
-                "text": text,
-                "lang": lang,
-                "translation": translated,
-            }))
-        except Exception as e:
-            logger.warning(f"send final failed: {e}")
+                "text": correct_text,
+                "corrected": True,
+                "replayed": True,
+              }
+            )
 
-        audio_buffer.clear()
-        partial_buffer.clear()
-        whisper_lang = None
-        first_partial_time = None
+          if correct_trans.strip():
+            await ws.send_json(
+              {
+                "type": "final_translate",
+                "translated": correct_trans,
+                "provisional": False,
+                "replace_last": False,
+                "replayed": True,
+              }
+            )
+            # 更新 merge context（以最後一條為基準）
+            now2 = time.perf_counter()
+            try:
+              emb2 = await embed(correct_trans)
+            except Exception as e:
+              log.error(f"embedding(corrected) error: {e}")
+              emb2 = None
+            last_translation_text = correct_trans
+            if emb2 is not None:
+              last_translation_embedding = emb2
+              last_translation_time = now2
 
-    def on_recognized(evt):
-        nonlocal websocket_active
+        # 3) 清掉 history（因為已經用 Whisper 正確重放）
+        utterance_history.clear()
 
-        if not websocket_active:
-            return
+        # 4) 把語言 lock 在新的 detected，並重啟 Azure ASR
+        provisional_lang = detected
+        lang_locked = True
+        await ws.send_json({"type": "lang_locked", "lang": detected})
+        await restart_azure()
 
-        if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech and evt.result.text:
-            asyncio.run_coroutine_threadsafe(send_final(evt.result.text), loop)
+      # --- Case B: match → 第一句驗證通過，直接 lock in ---
+      elif provisional_lang is not None and detected == provisional_lang:
+        log.info(f"✅ Language verified and locked: {detected}")
+        lang_locked = True
+        await ws.send_json({"type": "lang_locked", "lang": detected})
 
-    # 綁 Azure callback
-    recognizer.recognizing.connect(on_recognizing)
-    recognizer.recognized.connect(on_recognized)
+      # （Case C: detected 不在 LANG_MAP or unknown → 先保持現狀，等下一句再說）
+
+      current_utt_audio.clear()
+
+    recognizer.recognizing.connect(on_partial)
+    recognizer.recognized.connect(
+      lambda e: asyncio.run_coroutine_threadsafe(
+        on_final(e.result.text), loop
+      )
+    )
     recognizer.start_continuous_recognition_async().get()
 
-    # ====================================================
-    # WebSocket 接收聲音 → Azure + Whisper
-    # ====================================================
+  async def restart_azure():
+    """停掉舊的 recognizer，換新的語言重啟"""
+    nonlocal recognizer, push_stream
+    log.info("♻️ Restart Azure ASR with new language")
+
     try:
-        async for msg in websocket.iter_bytes():
-            if not websocket_active:
-                break
-            audio_buffer.extend(msg)
-            stream.write(msg)
-    except Exception as e:
-        logger.info(f"WebSocket closed with exception: {e}")
-    finally:
-        websocket_active = False
-        try:
-            stream.close()
-        except Exception:
-            pass
+      if recognizer:
+        recognizer.stop_continuous_recognition_async().get()
+      if push_stream:
+        push_stream.close()
+    except Exception:
+      pass
 
-        try:
-            recognizer.stop_continuous_recognition_async().get()
-        except Exception:
-            pass
+    recognizer = None
+    push_stream = None
 
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+    # 給 Azure SDK 一點時間確實停乾淨
+    await asyncio.sleep(0.2)
 
-        logger.info("🔌 WebSocket disconnected")
+    if provisional_lang:
+      await start_azure(provisional_lang)
+
+  # =============================
+  # Main loop
+  # =============================
+  try:
+    async for chunk in ws.iter_bytes():
+      # chunk = 16kHz mono PCM16
+      current_utt_audio.extend(chunk)
+
+      # --- 語言尚未決定，先做偵測（UNTIL） ---
+      if provisional_lang is None:
+        # 太小聲就先丟掉
+        if rms_energy(chunk) < SILENCE_RMS_THRESHOLD:
+          continue
+
+        if first_speech_time is None:
+          first_speech_time = time.perf_counter()
+
+        detect_buffer.extend(chunk)
+        elapsed = time.perf_counter() - first_speech_time
+
+        # 至少聽滿 MIN_DETECT_SEC 再丟去 Whisper
+        if elapsed >= MIN_DETECT_SEC and provisional_lang is None:
+          lang = await whisper_detect(bytes(detect_buffer))
+          log.info(f"🕒 Initial detect language: {lang}")
+          if lang not in LANG_MAP:
+            lang = "english"
+          provisional_lang = lang
+
+        # 最長不能超過 MAX_DETECT_SEC，超過就硬用英文
+        if elapsed >= MAX_DETECT_SEC and provisional_lang is None:
+          provisional_lang = "english"
+
+        # 一旦決定 provisional_lang：啟動 Azure ASR，開始即時翻譯
+        if provisional_lang:
+          await ws.send_json({"type": "lang", "lang": provisional_lang})
+          await start_azure(provisional_lang)
+          if push_stream and detect_buffer:
+            push_stream.write(bytes(detect_buffer))
+          detect_buffer.clear()
+        continue
+
+      # --- 語言已經有 provisional，直接塞到 Azure push_stream ---
+      if push_stream:
+        push_stream.write(chunk)
+
+  finally:
+    log.info("🔌 client disconnected")
+    try:
+      if recognizer:
+        recognizer.stop_continuous_recognition_async().get()
+      if push_stream:
+        push_stream.close()
+    except Exception:
+      pass
+
+
+@app.websocket("/ws/fixed")
+async def ws_fixed_entry(ws: WebSocket):
+    await ws_fixed(ws)
+    
+
+@app.websocket("/ws/multilang")
+async def multilang_endpoint(ws: WebSocket):
+    await ws_multilang_adaptive(ws)

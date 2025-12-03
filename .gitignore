@@ -1,5 +1,27 @@
-backend/.env
-*.env
+# =========================
+# Environment variables
+# =========================
 .env
-frontend/node_modules
-backend/__pycache__/
+*.env
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+
+# virtual environment
+venv/
+
+# =========================
+# Node / Frontend
+# =========================
+node_modules/
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+.vscode/
+.idea/
